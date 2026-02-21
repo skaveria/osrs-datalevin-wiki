@@ -107,16 +107,23 @@
 
 (defn backfill-items!
   "Backfill normalized item datoms from stored Infobox Item params.
-  Prints every `print-every` stored entities."
+  Prints every `print-every` stored entities.
+
+  Defensive against odd/partial rows coming back from datalevin spill vectors."
   ([] (backfill-items! 5000 2000))
   ([sample-n print-every]
    (wx/open-db!)
    (let [infobox-keys (->> (top-infobox-item-keys sample-n 80) :top (map first) vec)
-         rows (wx/q '[:find ?t ?p
-                      :where
-                      [?e :wiki/infobox-name "Infobox Item"]
-                      [?e :wiki/title ?t]
-                      [?e :wiki/infobox-params-edn ?p]])
+         rows-raw (wx/q '[:find ?t ?p
+                          :where
+                          [?e :wiki/infobox-name "Infobox Item"]
+                          [?e :wiki/title ?t]
+                          [?e :wiki/infobox-params-edn ?p]])
+         ;; normalize rows into plain vectors and drop anything weird
+         rows (->> rows-raw
+                   (map (fn [r] (when (and (sequential? r) (= 2 (count r))) (vec r))))
+                   (remove nil?)
+                   vec)
          total (count rows)]
      (reduce
       (fn [{:keys [i stored skipped bad] :as acc} [t p]]
