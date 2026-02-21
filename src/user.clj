@@ -1,14 +1,27 @@
 (ns user
   "REPL toolbelt for exploring the OSRS Wiki via the MediaWiki API,
-  and gently massaging wikitext into maps.
+  gently massaging wikitext into maps, and (optionally) storing/querying
+  normalized item facts in DataLevin.
 
   Intended usage:
-    - call (page-head \"Dragon longsword\")
-    - call (item \"Dragon longsword\")
-    - evolve from there at your own pace"
+    ;; Wiki poking:
+    (page-head \"Dragon longsword\")
+    (peek-wikitext \"Dragon longsword\" 200)
+    (item \"Dragon longsword\")
+    (pick (-> (item \"Dragon longsword\") :item)
+          [:osrs/item-id :osrs/examine :osrs/value :osrs/weight])
+
+    ;; DataLevin playground:
+    (open-database!)
+    (store-item! \"Dragon longsword\")
+    (query-database '[:find ?name ?value
+                      :where
+                      [?e :osrs/name ?name]
+                      [?e :osrs/value ?value]])"
   (:require
    [clj-http.client :as http]
    [cheshire.core :as json]
+   [datalevin.core :as datalevin]
    [clojure.string :as str]
    [clojure.pprint :as pp]))
 
@@ -34,6 +47,28 @@
   (when (and ms (pos? ms))
     (Thread/sleep (long ms))))
 
+(defn sleep-ms!
+  "Public sleep helper for other namespaces.
+  (We keep the private sleep! for internal use if you want.)"
+  [ms]
+  (sleep! ms))
+
+(defn show
+  "Pretty-print any value and return it (nice REPL ergonomics)."
+  [x]
+  (pp/pprint x)
+  x)
+
+(defn keys-of
+  "Return sorted keys of a map (for REPL discovery)."
+  [m]
+  (sort (keys m)))
+
+(defn pick
+  "Pick keys from a map."
+  [m ks]
+  (select-keys m ks))
+
 ;; -----------------------------------------------------------------------------
 ;; Low-level MediaWiki API access
 ;; -----------------------------------------------------------------------------
@@ -47,8 +82,8 @@
     instead of throwing a JSON parse exception."
   [params]
   (let [request-opts {:query-params (merge {:format "json"
-                                           ;; v2 makes shapes more consistent *but*
-                                           ;; it changes :pages to a vector. We handle both.
+                                           ;; v2 changes shapes (e.g. :pages becomes a vector),
+                                           ;; which we handle below.
                                            :formatversion "2"}
                                           params)
                       :headers {"User-Agent" *user-agent*
@@ -75,12 +110,6 @@
        :params params
        :body/snippet (subs body-trim 0 (min 400 (count body-trim)))})))
 
-(defn show
-  "Pretty-print any value and return it (nice REPL ergonomics)."
-  [x]
-  (pp/pprint x)
-  x)
-
 ;; -----------------------------------------------------------------------------
 ;; Fetch a page + latest revision (wikitext)
 ;; -----------------------------------------------------------------------------
@@ -106,14 +135,17 @@
       (map? pages)    (first (vals pages))
       :else           nil)))
 
-
 (defn page-head
+  "Return a compact map for a title. Includes wikitext when available.
+  If wiki-query returns {:wiki/error ...}, it is passed through unchanged."
   [title]
   (let [response (page-raw title)]
     (if (:wiki/error response)
       response
       (let [page     (first-page response)
             revision (first (:revisions page))
+            ;; formatversion=2 commonly uses :content.
+            ;; legacy uses :*.
             wikitext (or (get-in revision [:slots :main :content])
                          (get-in revision [:slots :main :*])
                          (:* revision))]
@@ -140,6 +172,7 @@
      (sleep! *sleep-ms*)
      (page-head title))
    titles))
+
 ;; -----------------------------------------------------------------------------
 ;; Template extraction from wikitext
 ;; -----------------------------------------------------------------------------
@@ -219,6 +252,19 @@
   "Extract+parse {{Infobox Bonuses ...}} from wikitext."
   [wikitext]
   (template wikitext "Infobox Bonuses"))
+
+(defn infobox
+  "Extract+parse a template by name from a page title.
+  Example: (infobox \"Dragon longsword\" \"Infobox Item\")"
+  [title template-name]
+  (let [t (wikitext title)]
+    (when t
+      (template t template-name))))
+
+(defn item*
+  "Raw Infobox Item params (strings)."
+  [title]
+  (infobox title "Infobox Item"))
 
 ;; -----------------------------------------------------------------------------
 ;; Normalization helpers (string -> useful types)
@@ -352,26 +398,126 @@
          (println (subs t 0 n))
          :ok)))))
 
-(defn infobox
-  "Extract+parse a template by name from a page title.
-  Example: (infobox \"Dragon longsword\" \"Infobox Item\")"
-  [title template-name]
-  (let [t (wikitext title)]
-    (when t
-      (template t template-name))))
+;; -----------------------------------------------------------------------------
+;; DataLevin: clear names, query playground vibe
+;; -----------------------------------------------------------------------------
 
-(defn item*
-  "Raw Infobox Item params (strings)."
-  [title]
-  (infobox title "Infobox Item"))
+(def database-directory
+  "Local folder for the DataLevin database. Add 'data/' to .gitignore."
+  "data/osrs-dl")
 
-(defn keys-of
-  "Return sorted keys of a map (for REPL discovery)."
+(def database-schema
+  "Minimal schema for item query playground."
+  {:osrs/item-id    {:db/valueType :db.type/long :db/unique :db.unique/identity}
+   :osrs/name       {:db/valueType :db.type/string}
+   :osrs/examine    {:db/valueType :db.type/string}
+   :osrs/value      {:db/valueType :db.type/long}
+   :osrs/weight     {:db/valueType :db.type/double}
+   :osrs/members?   {:db/valueType :db.type/boolean}
+   :osrs/tradeable? {:db/valueType :db.type/boolean}
+
+   ;; provenance (handy for debugging / refresh later)
+   :wiki/title      {:db/valueType :db.type/string}
+   :wiki/page-id    {:db/valueType :db.type/long}
+   :wiki/timestamp  {:db/valueType :db.type/string}})
+
+(defonce database-connection
+  (atom nil))
+
+(defn open-database!
+  "Open the DataLevin database (creates if missing) and apply schema."
+  []
+  (when-not @database-connection
+    (reset! database-connection
+            (datalevin/get-conn database-directory database-schema)))
+  @database-connection)
+
+(defn close-database!
+  "Close the DataLevin database connection."
+  []
+  (when-let [conn @database-connection]
+    (datalevin/close conn)
+    (reset! database-connection nil))
+  :closed)
+
+(defn database
+  "Return the current immutable database value."
+  []
+  (datalevin/db (open-database!)))
+
+(defn transact!
+  "Transact entity maps into the database.
+  Named 'transact!' because that's DataLevin's term, but it's the only
+  short-ish name left here."
+  [entity-maps]
+  (datalevin/transact! (open-database!) entity-maps))
+
+(defn query-database
+  "Run a Datalog query against the database."
+  [query & inputs]
+  (apply datalevin/q query (database) inputs))
+
+
+(defn remove-nil-values
+  "Return a map with any nil-valued entries removed."
   [m]
-  (sort (keys m)))
+  (into {}
+        (remove (fn [[_ v]] (nil? v)) m)))
+(defn store-item!
+  "Fetch an item from the wiki via (item title), then upsert into DataLevin by
+  :osrs/item-id.
 
-(defn pick
-  "Pick keys from a map."
-  [m ks]
-  (select-keys m ks))
+  If a page doesn't yield an :osrs/item-id (or other required fields), we skip it
+  with a readable result instead of crashing the whole batch."
+  [title]
+  (let [{:keys [page item] :as result} (item title)]
+    (cond
+      (:wiki/error result)
+      {:stored/items 0
+       :wiki/title title
+       :error (:wiki/error result)
+       :details result}
 
+      (nil? item)
+      {:stored/items 0
+       :wiki/title title
+       :error :no-normalized-item}
+
+      (nil? (:osrs/item-id item))
+      {:stored/items 0
+       :wiki/title title
+       :error :missing-item-id
+       :page page
+       :item (pick item [:osrs/name :osrs/examine :osrs/value :osrs/weight :osrs/options])}
+
+      :else
+      (let [entity
+            (remove-nil-values
+             (merge
+              {:osrs/item-id (:osrs/item-id item)}
+              (select-keys item [:osrs/name :osrs/examine :osrs/value :osrs/weight
+                                 :osrs/members? :osrs/tradeable? :osrs/options])
+              {:wiki/title (:wiki/title page)
+               :wiki/page-id (:wiki/page-id page)
+               :wiki/timestamp (:wiki/timestamp page)}))]
+        (transact! [entity])
+        {:stored/items 1
+         :osrs/item-id (:osrs/item-id item)
+         :wiki/title (:wiki/title page)}))))
+
+
+(defn store-items!
+  "Store many items, one by one (polite).
+  Never stops on a single bad page; returns receipts for everything."
+  [titles]
+  (mapv
+   (fn [title]
+     (sleep! *sleep-ms*)
+     (try
+       (store-item! title)
+       (catch Exception e
+         {:stored/items 0
+          :wiki/title title
+          :error :exception
+          :message (.getMessage e)})))
+   titles))

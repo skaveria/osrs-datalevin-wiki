@@ -20,3 +20,5 @@ pom.xml.asc
 .nrepl-port
 target/
 *.class
+
+data/
