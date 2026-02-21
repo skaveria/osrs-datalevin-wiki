@@ -22,6 +22,7 @@
    [clj-http.client :as http]
    [cheshire.core :as json]
    [datalevin.core :as datalevin]
+   [clojure.java.io :as io]
    [clojure.string :as str]
    [clojure.pprint :as pp]))
 
@@ -402,24 +403,33 @@
 ;; DataLevin: clear names, query playground vibe
 ;; -----------------------------------------------------------------------------
 
-(def database-directory
-  "Local folder for the DataLevin database. Add 'data/' to .gitignore."
-  "data/osrs-dl")
+(def database-directory "data/osrs-monsters-dl")
 
 (def database-schema
-  "Minimal schema for item query playground."
-  {:osrs/item-id    {:db/valueType :db.type/long :db/unique :db.unique/identity}
-   :osrs/name       {:db/valueType :db.type/string}
-   :osrs/examine    {:db/valueType :db.type/string}
-   :osrs/value      {:db/valueType :db.type/long}
-   :osrs/weight     {:db/valueType :db.type/double}
-   :osrs/members?   {:db/valueType :db.type/boolean}
-   :osrs/tradeable? {:db/valueType :db.type/boolean}
+  {:osrs/item-id      {:db/valueType :db.type/long :db/unique :db.unique/identity}
+   :osrs/name         {:db/valueType :db.type/string}
+   :osrs/examine      {:db/valueType :db.type/string}
+   :osrs/value        {:db/valueType :db.type/long}
+   :osrs/weight       {:db/valueType :db.type/double}
+   :osrs/members?     {:db/valueType :db.type/boolean}
+   :osrs/tradeable?   {:db/valueType :db.type/boolean}
+   :osrs/options      {:db/valueType :db.type/string}
+   :osrs/daily-volume {:db/valueType :db.type/long}
 
-   ;; provenance (handy for debugging / refresh later)
-   :wiki/title      {:db/valueType :db.type/string}
-   :wiki/page-id    {:db/valueType :db.type/long}
-   :wiki/timestamp  {:db/valueType :db.type/string}})
+:osrs/monster/raw-edn     {:db/valueType :db.type/string}
+:osrs/monster/combat      {:db/valueType :db.type/long}
+:osrs/monster/hitpoints   {:db/valueType :db.type/long}
+:osrs/monster/members?    {:db/valueType :db.type/boolean}
+:osrs/monster/examine     {:db/valueType :db.type/string}
+:osrs/monster/size        {:db/valueType :db.type/string}
+:osrs/monster/npc-id      {:db/valueType :db.type/long}
+:osrs/monster/slayer-lvl  {:db/valueType :db.type/long}
+:osrs/monster/slayer-xp   {:db/valueType :db.type/long}
+:osrs/monster/attributes  {:db/valueType :db.type/string :db/cardinality :db.cardinality/many}
+
+   :wiki/title        {:db/valueType :db.type/string}
+   :wiki/page-id      {:db/valueType :db.type/long}
+   :wiki/timestamp    {:db/valueType :db.type/string}})
 
 (defonce database-connection
   (atom nil))
@@ -521,3 +531,134 @@
           :error :exception
           :message (.getMessage e)})))
    titles))
+
+(def prices-api-volumes-url
+  "OSRS Wiki Prices API: daily volumes keyed by item id."
+  "https://prices.runescape.wiki/api/v1/osrs/volumes")
+
+(defn fetch-daily-volumes
+  "Fetch a map of {item-id -> daily-volume} from the Prices API."
+  []
+  (let [response (http/get prices-api-volumes-url
+                           {:headers {"User-Agent" *user-agent*
+                                      "Accept" "application/json"}
+                            :as :text
+                            :throw-exceptions false})
+        body (str/trim (or (:body response) ""))]
+    ;; shape is typically {:data {\"1305\" 1234, ...}}
+    (let [parsed (json/parse-string body true)
+          data   (:data parsed)]
+      ;; convert string keys to longs
+      (into {}
+            (map (fn [[k v]] [(Long/parseLong (name k)) (long v)]))
+            data))))
+
+(defn store-daily-volumes!
+  "Fetch daily volumes and write them into the DB for items we already have."
+  []
+  (let [volumes-by-id (fetch-daily-volumes)
+        existing-ids  (map first
+                           (query-database
+                            '[:find ?id
+                              :where
+                              [?e :osrs/item-id ?id]]))
+        tx-entities
+        (mapv (fn [item-id]
+                (let [vol (get volumes-by-id item-id)]
+                  ;; only transact if volume exists
+                  (when (some? vol)
+                    {:osrs/item-id item-id
+                     :osrs/daily-volume vol})))
+              existing-ids)
+        tx-entities (vec (remove nil? tx-entities))]
+    (transact! tx-entities)
+    {:updated (count tx-entities)}))
+
+
+
+(def baked-monsters-path
+  "resources/monsters.edn")
+
+(defn load-baked-monsters
+  "Returns a vector of baked monster records from resources/monsters.edn."
+  []
+  (read-string (slurp baked-monsters-path)))
+
+(defn first-int-in-string
+  "Returns the first integer found in s, or nil."
+  [s]
+  (when-let [s (nonblank s)]
+    (when-let [m (re-find #"\d+" s)]
+      (parse-int m))))
+
+(defn parse-attributes
+  "Infobox Monster 'attributes' sometimes comes as a comma-separated string.
+  Return a vector of cleaned attribute strings."
+  [s]
+  (when-let [s (some-> s nonblank)]
+    (->> (str/split s #"\s*,\s*")
+         (map nonblank)
+         (remove nil?)
+         vec)))
+
+(defn normalize-monster-infobox
+  "Turn a raw Infobox Monster map into a normalized map for DataLevin.
+  Keep it small + reliable, plus :osrs/monster/raw-edn for future."
+  [infobox]
+  (let [combat   (first-int-in-string (:combat infobox))
+        hp       (first-int-in-string (:hitpoints infobox))
+        ;; members sometimes appears as :members or :is_members_only depending on template
+        members? (or (parse-bool (:members infobox))
+                     (parse-bool (:is_members_only infobox)))
+        npc-id   (first-int-in-string (:id infobox))
+        slvl     (first-int-in-string (:slaylvl infobox))
+        sxp      (first-int-in-string (:slayxp infobox))
+        size     (some-> (:size infobox) nonblank)
+        examine  (some-> (:examine infobox) nonblank)
+        attrs    (or (parse-attributes (:attributes infobox))
+                     (parse-attributes (:attribute infobox)))]
+    {:osrs/monster/raw-edn   (pr-str infobox)
+     :osrs/monster/combat    combat
+     :osrs/monster/hitpoints hp
+     :osrs/monster/members?  members?
+     :osrs/monster/examine   examine
+     :osrs/monster/size      size
+     :osrs/monster/npc-id    npc-id
+     :osrs/monster/slayer-lvl slvl
+     :osrs/monster/slayer-xp  sxp
+     :osrs/monster/attributes attrs}))
+
+(defn monster->entity
+  "Convert a baked monster record {:wiki/title ... :osrs/monster {...}} into
+  a DataLevin entity map (nil-safe)."
+  [{:wiki/keys [title] :as rec}]
+  (let [infobox (:osrs/monster rec)]
+    (when (and (string? title) (map? infobox))
+      (let [normalized (normalize-monster-infobox infobox)
+            entity (remove-nil-values
+                    (merge {:wiki/title title}
+                           ;; flatten attributes into cardinality-many facts
+                           (dissoc normalized :osrs/monster/attributes)))]
+        ;; attach attributes as many-values if present
+        (if-let [attrs (:osrs/monster/attributes normalized)]
+          (assoc entity :osrs/monster/attributes attrs)
+          entity)))))
+
+(defn store-monster-records!
+  "Store baked monster records into DataLevin (upsert by :wiki/title).
+  Returns {:attempted N :stored M :skipped K}."
+  [records]
+  (let [entities (->> records
+                      (map monster->entity)
+                      (remove nil?)
+                      vec)]
+    (transact! entities)
+    {:attempted (count records)
+     :stored (count entities)
+     :skipped (- (count records) (count entities))}))
+
+(defn store-all-baked-monsters!
+  "Load resources/monsters.edn and store into DataLevin."
+  []
+  (open-database!)
+  (store-monster-records! (load-baked-monsters)))
