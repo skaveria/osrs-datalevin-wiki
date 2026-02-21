@@ -1,28 +1,19 @@
 (ns osrs.pie
   "Pie-locked theorycraft helpers.
 
-  This namespace is designed to be *fast after first run* by caching expensive
-  wiki reads into Datalevin:
-
-    :wiki/wikitext        (string)
-    :wiki/wikitext-ts     (string)
-    :wiki/drop-sources    (vector of strings)
-    :wiki/drop-sources-ts (string)
-
-  It depends on `user` for:
-    - wiki-query / wikitext
-    - transact! / query-database
-    - sleep-ms! / *sleep-ms*"
+  This namespace is intentionally small + explicit:
+  - It leans on `user` for the MediaWiki API + Datalevin connection.
+  - It provides pie-specific extraction + graph closure helpers."
   (:require
    [clojure.string :as str]
    [user :as u]))
 
 ;; ------------------------------------------------------------
-;; Filters
+;; Filtering helpers
 ;; ------------------------------------------------------------
 
 (defn pie-source-title?
-  "Filter out obvious non-monster / meta noise from Drop sources expansion."
+  "Filter out obvious non-monster noise from Drop sources expansion."
   [t]
   (and (string? t)
        (not (str/starts-with? t "Raging Echoes League/"))
@@ -32,7 +23,7 @@
                "Reward"} t))))
 
 (defn ingredientish-title?
-  "Filter out obvious junk tokens from Creation snippets."
+  "Filter out obvious junk from 'Creation' snippets when extracting ingredient tokens."
   [t]
   (and (string? t)
        (not (str/blank? t))
@@ -60,11 +51,36 @@
                "Cooks' Guild"} t))))
 
 ;; ------------------------------------------------------------
+;; MediaWiki template expansion (same trick you used in REPL)
+;; ------------------------------------------------------------
+
+(defn parse-wikitext
+  "Ask MediaWiki to parse arbitrary wikitext and return the :parse map."
+  [wikitext]
+  (:parse
+   (u/wiki-query {:action "parse"
+                  :contentmodel "wikitext"
+                  :text wikitext
+                  :prop "links"})))
+
+(defn drop-sources-links
+  "Return mainspace (ns=0) titles produced by {{Drop sources|...}}."
+  [item-title]
+  (let [wikitext (str "{{Drop sources|" item-title "}}")
+        parsed   (parse-wikitext wikitext)
+        links    (:links parsed)]
+    (->> links
+         (filter #(= 0 (:ns %)))
+         (map :title)
+         distinct
+         vec)))
+
+;; ------------------------------------------------------------
 ;; DB helpers
 ;; ------------------------------------------------------------
 
 (defn npc-title?
-  "True if this title exists as a monster/NPC entity in our DB."
+  "True if this title exists in our monster DB (by :wiki/title)."
   [title]
   (boolean
    (ffirst
@@ -93,65 +109,13 @@
   (->> titles (filter npc-title?) vec))
 
 ;; ------------------------------------------------------------
-;; Cache layer (DB-first, API fallback)
-;; ------------------------------------------------------------
-
-(defn cached-wikitext
-  "Return wikitext for a title from DB if present; otherwise fetch from API and store."
-  [title]
-  (or
-   (ffirst
-    (u/query-database
-     '[:find ?wt
-       :in $ ?t
-       :where
-       [?e :wiki/title ?t]
-       [?e :wiki/wikitext ?wt]]
-     title))
-   (let [wt (u/wikitext title)]
-     (when (string? wt)
-       (u/transact! [{:wiki/title title
-                      :wiki/wikitext wt
-                      :wiki/wikitext-ts (str (java.time.Instant/now))}]))
-     wt)))
-
-(defn cached-drop-sources
-  "Return drop sources for an item from DB if present; otherwise expand {{Drop sources|...}}
-  via the wiki API and store."
-  [item-title]
-  (or
-   (ffirst
-    (u/query-database
-     '[:find ?xs
-       :in $ ?t
-       :where
-       [?e :wiki/title ?t]
-       [?e :wiki/drop-sources ?xs]]
-     item-title))
-   (let [xs (->> (u/wiki-query {:action "parse"
-                                :contentmodel "wikitext"
-                                :text (str "{{Drop sources|" item-title "}}")
-                                :prop "links"})
-                 :parse
-                 :links
-                 (filter #(= 0 (:ns %)))
-                 (map :title)
-                 (filter pie-source-title?)
-                 distinct
-                 vec)]
-     (u/transact! [{:wiki/title item-title
-                    :wiki/drop-sources xs
-                    :wiki/drop-sources-ts (str (java.time.Instant/now))}])
-     xs)))
-
-;; ------------------------------------------------------------
 ;; Wikitext snippet + token extraction
 ;; ------------------------------------------------------------
 
 (defn snippet
   "Return a substring of a page's wikitext around the first occurrence of marker."
   [title marker radius]
-  (let [wt (cached-wikitext title)]
+  (let [wt (u/wikitext title)]
     (when (and (string? wt) (not (str/blank? wt)))
       (when-let [i (str/index-of wt marker)]
         (subs wt
@@ -169,7 +133,8 @@
          vec)))
 
 (defn wikilinks-in-text
-  "Extract [[Target]] / [[Target|...]] left-hand targets from wikitext."
+  "Extract [[Target]] / [[Target|...]] left-hand targets from wikitext.
+  (Intentionally simple: good enough for REPL-style wiki pages.)"
   [text]
   (when (string? text)
     (->> (re-seq #"\[\[([^\]|#]+)" text)
@@ -191,7 +156,7 @@
            vec))))
 
 ;; ------------------------------------------------------------
-;; Implied ingredient edges (for transitive closure)
+;; Implied ingredient edges (needed to make Cow appear for Meat pie)
 ;; ------------------------------------------------------------
 
 (def implied-ingredient-edges
@@ -209,17 +174,21 @@
        vec))
 
 (defn npc-droppers-of-item
-  "NPC droppers for an item title (DB-filtered). Cached for speed."
+  "NPC droppers for an item title (filtered to actual monster DB titles)."
   [item-title]
-  (only-npcs (cached-drop-sources item-title)))
+  (only-npcs
+   (->> (drop-sources-links item-title)
+        (filter pie-source-title?)
+        vec)))
 
 ;; ------------------------------------------------------------
-;; Dependency closure: items -> ingredients -> ingredients... collecting NPCs
+;; Dependency closure: items -> ingredients -> ingredients ... collecting NPCs
 ;; ------------------------------------------------------------
 
 (defn pie-dependency-closure
   "Return {:items #{...} :monsters #{...}} reachable from root-item.
-  depth controls how many ingredient expansions we do (3–4 is usually plenty)."
+
+  depth controls how many ingredient expansions we do. 3–4 is usually plenty."
   [root-item depth]
   (loop [frontier (list root-item)
          seen-items #{}
@@ -242,7 +211,7 @@
                    (dec remaining))))))))
 
 ;; ------------------------------------------------------------
-;; Pie list + rankings
+;; Pies: category -> closures -> monsters -> rankings
 ;; ------------------------------------------------------------
 
 (defn all-category-member-titles
@@ -269,52 +238,58 @@
        distinct
        vec))
 
-(defn all-pie-monsters-total
-  "Compute ingredient-closure monsters + direct pie droppers.
-
-  Returns:
-    {:closures {...}
-     :pie->ingredient-monsters {...}
-     :ingredient-monsters [...]
-     :direct-pie-droppers [...]
-     :all-monsters [...]}"
+(defn pie-closures
+  "Compute closure per pie title. Returns {pie-title -> closure-map}."
   [pie-titles depth]
-  (let [closures
-        (into {}
-              (for [pie pie-titles]
-                (do (u/sleep-ms! u/*sleep-ms*)
-                    [pie (pie-dependency-closure pie depth)])))
+  (into {}
+        (for [pie pie-titles]
+          (do (u/sleep-ms! u/*sleep-ms*)
+              [pie (pie-dependency-closure pie depth)]))))
 
-        pie->ingredient-monsters
-        (into {}
-              (for [[pie cl] closures]
-                [pie (->> (:monsters cl) distinct sort vec)]))
+(defn pie->ingredient-monsters
+  "Convert closures to {pie-title -> [monster-title ...]} from the ingredient graph only."
+  [closures]
+  (into {}
+        (for [[pie cl] closures]
+          [pie (->> (:monsters cl)
+                    distinct
+                    sort
+                    vec)])))
 
-        ingredient-monsters
-        (->> (vals pie->ingredient-monsters)
-             (apply concat)
-             distinct
-             vec)
+(defn all-ingredient-monsters
+  "Union all ingredient-graph monsters across pies."
+  [pie->monsters-map]
+  (->> (vals pie->monsters-map)
+       (apply concat)
+       distinct
+       vec))
 
-        direct-pie-droppers
-        (->> pie-titles
-             (mapcat (fn [pie] (only-npcs (cached-drop-sources pie))))
-             distinct
-             vec)
+(defn all-direct-pie-droppers
+  "Monsters that drop any pie directly (not via ingredient graph)."
+  [pie-titles]
+  (->> pie-titles
+       (mapcat (fn [pie]
+                 (->> (drop-sources-links pie)
+                      (filter pie-source-title?)
+                      only-npcs)))
+       distinct
+       vec))
 
-        all-monsters
-        (->> (concat ingredient-monsters direct-pie-droppers)
-             distinct
-             vec)]
-
+(defn all-pie-monsters-total
+  "Union ingredient-graph monsters + direct pie droppers."
+  [pie-titles depth]
+  (let [closures (pie-closures pie-titles depth)
+        pie->mons (pie->ingredient-monsters closures)
+        ingredient-mons (all-ingredient-monsters pie->mons)
+        direct (all-direct-pie-droppers pie-titles)]
     {:closures closures
-     :pie->ingredient-monsters pie->ingredient-monsters
-     :ingredient-monsters ingredient-monsters
-     :direct-pie-droppers direct-pie-droppers
-     :all-monsters all-monsters}))
+     :pie->ingredient-monsters pie->mons
+     :ingredient-monsters ingredient-mons
+     :direct-pie-droppers direct
+     :all-monsters (->> (concat ingredient-mons direct) distinct vec)}))
 
 (defn monsters-with-combat
-  "Attach combat levels and sort descending. Returns [[monster combat] ...]."
+  "Attach combat levels and sort. Returns [[monster combat] ...]."
   [monster-titles]
   (->> monster-titles
        (map (fn [m] [m (combat-of m)]))

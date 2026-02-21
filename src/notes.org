@@ -1,0 +1,39 @@
+#+title: Notes
+
+
+*** cooked chicken
+
+- Raging Echoes League
+
+*** cooked meat
+
+- Barbarian
+- Barbarian (Barbarian Camp)
+- Gunthor the brave
+- Imp
+- Minotaur
+- Raging Echoes League
+
+*** pastry dough
+
+- Raging Echoes League
+
+*** pie dish
+
+- Mining
+- Oak shelves 2
+- Raging Echoes League
+- Soil
+- Teak shelves 1
+- Teak shelves 2
+
+*** pie shell
+
+- Raging Echoes League
+
+*** uncooked meat pie
+
+- Raging Echoes League
+
+;; => nil
+user> 
