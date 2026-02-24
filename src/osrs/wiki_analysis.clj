@@ -73,6 +73,12 @@
 ;; Item normalization backfill (DB-only)
 ;; ------------------------------------------------------------
 
+(defn infobox-item-keys []
+  (->> (top-infobox-item-keys 5000 60)
+       :top
+       (map first)
+       vec))
+
 (defn normalize-item-entity
   "Turn parsed Infobox Item params into a normalized entity map.
   Stores both typed fields and a full infobox blob."
@@ -147,3 +153,122 @@
                 {:i i' :stored stored' :skipped skipped :bad bad})))))
       {:i 0 :stored 0 :skipped 0 :bad 0}
       rows))))
+
+(defn base-key
+  "Turn :name12 -> :name, :bucketname3 -> :bucketname, leave :name as-is."
+  [k]
+  (-> k name (str/replace #"\d+$" "") keyword))
+
+(defn db-wikitext
+  [title]
+  (ffirst
+   (osrs.wiki-ingest/q
+    '[:find ?wt
+      :in $ ?t
+      :where
+      [?e :wiki/title ?t]
+      [?e :wiki/wikitext ?wt]]
+    title)))
+
+
+
+
+(defn extract-template-block
+  "Return the first {{Template ...}} block (raw string), or nil."
+  [wikitext template-name]
+  (when (and (string? wikitext) (not (str/blank? wikitext)))
+    (let [needle (str "{{" template-name)
+          start  (str/index-of wikitext needle)]
+      (when start
+        (loop [i start depth 0]
+          (cond
+            (>= i (count wikitext)) nil
+
+            (and (< (inc i) (count wikitext))
+                 (= \{ (.charAt wikitext i))
+                 (= \{ (.charAt wikitext (inc i))))
+            (recur (+ i 2) (inc depth))
+
+            (and (< (inc i) (count wikitext))
+                 (= \} (.charAt wikitext i))
+                 (= \} (.charAt wikitext (inc i))))
+            (let [d (dec depth)
+                  j (+ i 2)]
+              (if (zero? d)
+                (subs wikitext start j)
+                (recur j d)))
+
+            :else
+            (recur (inc i) depth)))))))
+
+(defn parse-template-params
+  "Parse lines like: |key = value into {:key \"value\"}."
+  [template-block]
+  (->> (str/split-lines (or template-block ""))
+       (keep (fn [line]
+               (when (str/starts-with? line "|")
+                 (let [[k v] (str/split (subs line 1) #"\s*=\s*" 2)]
+                   (when (and k v)
+                     [(keyword (str/trim k)) (str/trim v)])))))
+       (into {})))
+
+
+
+(defn all-item-infobox-keys
+  []
+  (let [rows
+        (osrs.wiki-ingest/q
+         '[:find ?t
+           :where
+           [?e :wiki/title ?t]
+           [?e :wiki/wikitext _]])]
+    (->> rows
+         (map first)
+         (map item-infobox)
+         (remove nil?)
+         (mapcat keys)
+         distinct
+         sort
+         vec)))
+
+(defn item-infobox
+  "Return parsed Infobox Item map for a title from the local DB."
+  [title]
+  (let [wt (db-wikitext title)
+        block (extract-template-block wt "Infobox Item")]
+    (when block
+      (parse-template-params block))))
+
+
+(def smushed-item-keys
+  (->> (all-item-infobox-keys)
+       (map base-key)
+       distinct
+       sort
+       vec))
+
+
+(def key-variants
+  (->> (all-item-infobox-keys)
+       (map (fn [k] [(base-key k) k]))
+       (group-by first)))
+
+(->> key-variants
+     (map (fn [[bk pairs]] [bk (count pairs)]))
+     (sort-by second >)
+     (take 30))
+
+(defn items-with-removal
+  []
+  (->> (osrs.wiki-ingest/q
+        '[:find ?t
+          :where
+          [?e :wiki/title ?t]
+          [?e :wiki/wikitext _]])
+       (map first)
+       (map (fn [t] [t (item-infobox t)]))
+       (filter (fn [[_ ib]] (and ib (:removal ib))))
+       (map first)
+       vec))
+
+(items-with-removal)
