@@ -41,6 +41,30 @@
    :quest/recommended-link   {:db/valueType :db.type/string
                               :db/cardinality :db.cardinality/many}
 
+   
+   :monster/combat-level {:db/valueType :db.type/long}
+:monster/hitpoints    {:db/valueType :db.type/long}
+:monster/slayer-level {:db/valueType :db.type/long}
+:monster/slayer-xp    {:db/valueType :db.type/long}
+   :monster/npc-id       {:db/valueType :db.type/long}
+
+   :monster/attributes {:db/valueType :db.type/string :db/cardinality :db.cardinality/many}
+:monster/attack-style {:db/valueType :db.type/string :db/cardinality :db.cardinality/many}
+
+:monster/weakness-type {:db/valueType :db.type/string}
+:monster/weakness-percent {:db/valueType :db.type/long}
+
+:monster/immunity {:db/valueType :db.type/string :db/cardinality :db.cardinality/many}
+
+:monster/defence-stab {:db/valueType :db.type/long}
+:monster/defence-slash {:db/valueType :db.type/long}
+:monster/defence-crush {:db/valueType :db.type/long}
+:monster/defence-magic {:db/valueType :db.type/long}
+:monster/defence-range {:db/valueType :db.type/long}
+
+:monster/defence-light {:db/valueType :db.type/long}
+:monster/defence-standard {:db/valueType :db.type/long}
+:monster/defence-heavy {:db/valueType :db.type/long}
    ;; Canonical item titles
    :quest/required-item      {:db/valueType :db.type/string
                               :db/cardinality :db.cardinality/many}
